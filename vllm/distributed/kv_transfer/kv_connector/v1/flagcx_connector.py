@@ -1,19 +1,5 @@
 # SPDX-License-Identifier: Apache-2.0
-"""
-FlagCX KV Connector for vLLM PD Disaggregation.
-
-Uses FlagCX one-sided RDMA primitives (PutSignal + WaitSignal) for
-KV cache transfer between Prefill and Decode instances.
-
-Architecture:
-  - All P/D ranks join a single flagcxComm via MPI bootstrap at startup.
-  - KV cache buffers + signal buffer are registered collectively
-    (flagcxOneSideRegister / flagcxOneSideSignalRegister), which builds
-    a full-mesh IB connection and AllGathers MR metadata.
-  - Actual data transfer uses flagcxPutSignal (RDMA WRITE + ATOMIC)
-    on the sender side and flagcxWaitSignal (GPU streamWaitValue64)
-    on the receiver side — no ZMQ round-trip needed for completion.
-"""
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import asyncio
 import ctypes
 import os
@@ -59,9 +45,6 @@ if TYPE_CHECKING:
     from vllm.v1.kv_cache_interface import KVCacheConfig
     from vllm.v1.request import Request
 
-# ---------------------------------------------------------------------------
-# Load FlagCX wrapper
-# ---------------------------------------------------------------------------
 _flagcx_path = os.getenv("FLAGCX_PATH")
 if _flagcx_path and os.path.isdir(_flagcx_path):
     if _flagcx_path not in sys.path:
@@ -74,6 +57,8 @@ try:
         flagcxComm_t,
         flagcxStream_t,
         flagcxUniqueId,
+        flagcxOneSideRegister,
+        flagcxOneSideSignalRegister
     )
 except ImportError as e:
     raise ImportError(
@@ -81,9 +66,6 @@ except ImportError as e:
         "root (containing plugin/interservice/flagcx_wrapper.py)."
     ) from e
 
-# ---------------------------------------------------------------------------
-# Type aliases / constants
-# ---------------------------------------------------------------------------
 EngineId = str
 ReqId = str
 
@@ -105,13 +87,11 @@ class FlagCXAgentMetadata(
     block_ids: list[list[int]]
     uid_bytes: Optional[bytes] = None  # set on first contact to init pair comm
 
-
 @dataclass
 class RecvReqMeta:
     local_block_ids: list[int]
     remote_host: str
     remote_port: int
-
 
 @dataclass
 class SendBlockMeta:
@@ -119,24 +99,20 @@ class SendBlockMeta:
     ready: threading.Event
     expire_time: float = float("inf")
 
-
 @dataclass
 class SendReqMeta:
     reqs: dict[ReqId, SendBlockMeta]
     lock: threading.Lock
-
 
 @dataclass
 class FinishedSendReqSet:
     set: set[ReqId]
     lock: threading.Lock
 
-
 @dataclass
 class FinishedReceiveReqSet:
     set: set[ReqId]
     lock: asyncio.Lock
-
 
 class FlagCXConnectorMetadata(KVConnectorMetadata):
     def __init__(self):
@@ -159,10 +135,6 @@ class FlagCXConnectorMetadata(KVConnectorMetadata):
         else:
             self.reqs_to_send[request_id] = local_block_ids
 
-
-# ===================================================================
-# Top-level connector (routes to Scheduler / Worker impl)
-# ===================================================================
 class FlagCXConnector(KVConnectorBase_V1):
     def __init__(
         self,
@@ -250,10 +222,6 @@ class FlagCXConnector(KVConnectorBase_V1):
     def wait_for_save(self):
         pass
 
-
-# ===================================================================
-# Scheduler-side
-# ===================================================================
 class FlagCXConnectorScheduler:
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
         self.vllm_config = vllm_config
@@ -369,10 +337,6 @@ class FlagCXConnectorScheduler:
             remote_port=self.side_channel_port,
         )
 
-
-# ===================================================================
-# Worker-side
-# ===================================================================
 class FlagCXConnectorWorker:
     def __init__(self, vllm_config: VllmConfig, engine_id: str):
         logger.info("FlagCX Connector Worker init: %s", engine_id)
@@ -480,9 +444,6 @@ class FlagCXConnectorWorker:
         self._encoder = msgspec.msgpack.Encoder()
         self._decoder = msgspec.msgpack.Decoder(FlagCXAgentMetadata)
 
-    # ------------------------------------------------------------------
-    # Per-pair comm helpers
-    # ------------------------------------------------------------------
     def _register_kv_for_comm(self, comm: Any) -> None:
         """Register all KV tensors + signal buffer with a newly created
         per-pair comm.  Both sides call this right after flagcxCommInitRank;
@@ -528,9 +489,6 @@ class FlagCXConnectorWorker:
         logger.info("Pair comm ready (initiator/rank=0) ↔ %s", remote_zmq_addr)
         return comm
 
-    # ------------------------------------------------------------------
-    # KV cache registration (local metadata collection)
-    # ------------------------------------------------------------------
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
         """Collect KV cache tensor metadata for later per-pair registration.
 
@@ -598,9 +556,6 @@ class FlagCXConnectorWorker:
         self._sender_t.start()
         ready_event.wait()
 
-    # ------------------------------------------------------------------
-    # Sender thread (Prefiller side)
-    # ------------------------------------------------------------------
     def _sender_thread(
         self, ready_event: threading.Event, base_port: int, tp_rank: int
     ):
@@ -797,9 +752,6 @@ class FlagCXConnectorWorker:
             time.perf_counter() - start_time,
         )
 
-    # ------------------------------------------------------------------
-    # Receiver side (Decode)
-    # ------------------------------------------------------------------
     def _receiver_loop_fn(self, loop: asyncio.AbstractEventLoop):
         asyncio.set_event_loop(loop)
         loop.run_forever()
@@ -907,9 +859,6 @@ class FlagCXConnectorWorker:
             kv_pulls[path].append((req_id, meta.local_block_ids))
         return kv_pulls
 
-    # ------------------------------------------------------------------
-    # get_finished (polled by scheduler)
-    # ------------------------------------------------------------------
     async def _fetch_finished_recving(self) -> set[ReqId]:
         async with self.finished_recving_reqs.lock:
             result = self.finished_recving_reqs.set
@@ -948,9 +897,6 @@ class FlagCXConnectorWorker:
 
         return finished_sending or None, finished_recving or None
 
-    # ------------------------------------------------------------------
-    # Cleanup
-    # ------------------------------------------------------------------
     def __del__(self):
         self.shutdown()
 
@@ -965,10 +911,6 @@ class FlagCXConnectorWorker:
             self.receiver_loop.call_soon_threadsafe(self.receiver_loop.stop)
             self._receiver_t.join(timeout=2)
 
-
-# ===================================================================
-# Utilities
-# ===================================================================
 def _group_contiguous(
     src_indices: list[int], dst_indices: list[int]
 ) -> tuple[list[list[int]], list[list[int]]]:
@@ -989,4 +931,3 @@ def _get_side_channel_port(vllm_config: VllmConfig) -> int:
         + vllm_config.parallel_config.data_parallel_rank
         * vllm_config.parallel_config.tensor_parallel_size
     )
-
