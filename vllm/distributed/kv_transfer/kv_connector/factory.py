@@ -195,9 +195,3 @@ KVConnectorFactory.register_connector(
     "vllm.distributed.kv_transfer.kv_connector.v1.mooncake_connector",
     "MooncakeConnector",
 )
-
-KVConnectorFactory.register_connector(
-    "FlagCXConnector",
-    "vllm.distributed.kv_transfer.kv_connector.v1.flagcx_connector",
-    "FlagCXConnector",
-)
