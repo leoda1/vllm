@@ -19,6 +19,7 @@ import zmq
 import zmq.asyncio
 
 from vllm.attention.backends.abstract import AttentionMetadata
+from vllm.utils.torch_utils import current_stream
 from vllm.attention.selector import get_attn_backend
 from vllm.config import VllmConfig
 from vllm.distributed.kv_transfer.kv_connector.utils import TpKVTopology
@@ -111,7 +112,6 @@ class FinishedReceiveReqSet:
 @dataclass
 class PendingSignalWait:
     req_ids: list[ReqId]
-    path: str = ""
     comm: Any = None
     peer_rank: int = -1
     signal_value: int = 0
@@ -370,8 +370,6 @@ class FlagCXConnectorWorker:
             library_path = os.path.join(flagcx_path, "build/lib/libflagcx.so")
         self.flagcx = FLAGCXLibrary(library_path)
         self.cuda_device_index = torch.cuda.current_device()
-        self._device_switch_logged_threads: set[int] = set()
-        self._device_switch_log_lock = threading.Lock()
 
         # ---- Per-pair comms (lazily created on first transfer with each peer) ----
         # key: remote ZMQ address "host:port+tp_rank", value: PairCommInfo
@@ -473,7 +471,7 @@ class FlagCXConnectorWorker:
         self._encoder = msgspec.msgpack.Encoder()
         self._decoder = msgspec.msgpack.Decoder(FlagCXAgentMetadata)
 
-    def _ensure_cuda_device(self, reason: str = "") -> None:
+    def _ensure_cuda_device(self) -> None:
         """Background threads start with their own CUDA current-device state.
 
         Pair-comm init and signal-buffer allocation must happen on the same
@@ -482,21 +480,11 @@ class FlagCXConnectorWorker:
         """
         current = torch.cuda.current_device()
         if current != self.cuda_device_index:
-            tid = threading.get_ident()
-            should_log = False
-            with self._device_switch_log_lock:
-                if tid not in self._device_switch_logged_threads:
-                    self._device_switch_logged_threads.add(tid)
-                    should_log = True
-            if should_log:
-                logger.info(
-                    "Switching CUDA device in background thread: current=%d "
-                    "target=%d reason=%s thread_id=%d",
-                    current,
-                    self.cuda_device_index,
-                    reason or "unknown",
-                    tid,
-                )
+            logger.warning(
+                "Switching CUDA device in background thread: current=%d target=%d",
+                current,
+                self.cuda_device_index,
+            )
             torch.cuda.set_device(self.cuda_device_index)
 
     @staticmethod
@@ -512,7 +500,7 @@ class FlagCXConnectorWorker:
 
         Returns the newly allocated per-pair GPU signal buffer (caller must
         keep a reference to prevent GC)."""
-        self._ensure_cuda_device("register_kv_for_comm")
+        self._ensure_cuda_device()
         for base_addr, size in self.kv_tensors_meta:
             self.flagcx.flagcxOneSideRegister(comm, base_addr, size)
         # Allocate a *per-pair* signal buffer so different Prefill peers
@@ -557,8 +545,7 @@ class FlagCXConnectorWorker:
                 return self.pair_comms[remote_zmq_addr].comm
 
         try:
-            init_start = time.perf_counter()
-            self._ensure_cuda_device("init_pair_comm_responder")
+            self._ensure_cuda_device()
             uid = self.flagcx.unique_id_from_bytes(uid_bytes)
             uid_ptr = ctypes.POINTER(flagcxUniqueId)(uid)
             comm = self.flagcx.flagcxCommInitRank(2, uid_ptr, 1)
@@ -568,9 +555,7 @@ class FlagCXConnectorWorker:
                     comm=comm, my_rank=1, signal_buffer=signal_buffer,
                 )
             logger.info(
-                "Pair comm ready (responder/rank=1) ↔ %s in %.3fs",
-                remote_zmq_addr,
-                time.perf_counter() - init_start,
+                "Pair comm ready (responder/rank=1) ↔ %s", remote_zmq_addr
             )
             return comm
         finally:
@@ -584,19 +569,14 @@ class FlagCXConnectorWorker:
         """Decode side: called in executor thread after uid has been sent to
         Prefill.  Blocks on CommInitRank(rank=0) + OneSideRegister so both
         sides rendezvous before any PutSignal is issued."""
-        init_start = time.perf_counter()
-        self._ensure_cuda_device("finalize_pair_comm_initiator")
+        self._ensure_cuda_device()
         comm = self.flagcx.flagcxCommInitRank(2, uid, 0)
         signal_buffer = self._register_kv_for_comm(comm)
         with self.pair_comms_lock:
             self.pair_comms[remote_zmq_addr] = PairCommInfo(
                 comm=comm, my_rank=0, signal_buffer=signal_buffer,
             )
-        logger.info(
-            "Pair comm ready (initiator/rank=0) ↔ %s in %.3fs",
-            remote_zmq_addr,
-            time.perf_counter() - init_start,
-        )
+        logger.info("Pair comm ready (initiator/rank=0) ↔ %s", remote_zmq_addr)
         return comm
 
     def register_kv_caches(self, kv_caches: dict[str, torch.Tensor]):
@@ -757,7 +737,7 @@ class FlagCXConnectorWorker:
         The last call carries a signal increment so the receiver's
         flagcxWaitSignal unblocks.
         """
-        self._ensure_cuda_device("_send_blocks")
+        self._ensure_cuda_device()
         local_base_addr = self.kv_caches_base_addr
         remote_base_addr = agent_meta.kv_caches_base_addr
         block_len = self.block_len
@@ -964,7 +944,6 @@ class FlagCXConnectorWorker:
             for path, req_blocks in kv_pulls.items():
                 pending_wait = PendingSignalWait(
                     req_ids=[rb[0] for rb in req_blocks],
-                    path=path,
                 )
                 with self._active_signal_waits_lock:
                     self._active_signal_waits.append(pending_wait)
@@ -1000,18 +979,12 @@ class FlagCXConnectorWorker:
             self._active_signal_waits = []
         if not waits:
             return
-        self._ensure_cuda_device("wait_for_layer_load")
+        self._ensure_cuda_device()
         torch_stream = torch.cuda.current_stream()
         flagcx_stream = self.flagcx.adaptor_stream_copy(torch_stream)
         try:
             for w in waits:
-                ready = w.ready.wait(timeout=60)
-                if not ready:
-                    logger.error(
-                        "Pending signal wait not ready after 60s: path=%s reqs=%s",
-                        w.path,
-                        w.req_ids,
-                    )
+                w.ready.wait(timeout=60)
                 if w.comm is not None and w.signal_value > 0:
                     try:
                         self.flagcx.flagcxWaitSignal(
@@ -1032,15 +1005,6 @@ class FlagCXConnectorWorker:
                             w.req_ids,
                         )
                         raise
-                elif ready:
-                    logger.error(
-                        "Pending signal wait became ready without comm/signal: "
-                        "path=%s comm=%s signal_value=%d reqs=%s",
-                        w.path,
-                        self._comm_repr(w.comm),
-                        w.signal_value,
-                        w.req_ids,
-                    )
         finally:
             self.flagcx.adaptor_stream_free(flagcx_stream)
 
